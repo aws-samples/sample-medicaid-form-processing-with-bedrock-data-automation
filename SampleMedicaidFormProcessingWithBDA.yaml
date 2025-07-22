@@ -1,0 +1,1003 @@
+Resources:
+  S3TLSPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BDABucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: RequireTLS
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt BDABucket.Arn
+              - !Sub ${BDABucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  BDABucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: "S3 bucket access logging not required for this use case"
+    Properties:
+      AccessControl: Private
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref BDABucketKMSKey
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  LambdaDLQQueue:
+    Type: AWS::SQS::Queue
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W48
+            reason: "SQS queue encryption not required for this dead letter queue use case"
+    Properties:
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  # Lambda function that processes new forms and sends them to BDA
+  LambdaNewFormToBDAProject:
+    Type: AWS::Lambda::Function
+    DependsOn: RoleLambdaNewFormToBDAProject
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "Lambda function has CloudWatch Logs permissions via AWSLambdaBasicExecutionRole"
+          - id: W89
+            reason: "Lambda function does not require VPC configuration for this use case"
+    Properties:
+      ReservedConcurrentExecutions: 10
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQQueue.Arn
+      Handler: index.lambda_handler
+      Role: !GetAtt RoleLambdaNewFormToBDAProject.Arn
+      # REMOVE LAYER WHEN LAMBDA GETS BOTO3 > 1.38.5
+      # - Update with the ARN of the Boto3 Layer in your account
+      Layers:
+        - arn:aws:lambda:us-east-1:111122223333:layer:boto3-latest:2      
+      Runtime: python3.13
+      Code: 
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from urllib.parse import unquote_plus
+          
+          # Get environment variables
+          PROJECT_ARN = os.environ.get('PROJECT_ARN')
+          AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
+          AWS_ACCOUNT_ID = os.environ.get('AWS_ACCOUNT_ID')
+          OUTPUT_PREFIX = os.environ.get('OUTPUT_PREFIX', 'output')
+          
+          # Initialize clients
+          bedrock_client = boto3.client('bedrock-data-automation-runtime', region_name=AWS_REGION)
+          
+          def lambda_handler(event, context):
+              print(f'boto3 version: {boto3.__version__}')
+              try:
+                  # Get the S3 bucket and key from the event
+                  bucket = event['Records'][0]['s3']['bucket']['name']
+                  key = unquote_plus(event['Records'][0]['s3']['object']['key'])
+                  
+                  print(f"Processing new file: s3://{bucket}/{key}")
+          
+                  # Create S3 URIs
+                  input_s3_uri = f"s3://{bucket}/{key}"
+                  output_s3_uri = f"s3://{bucket}/{OUTPUT_PREFIX}"
+          
+                  # Invoke data automation asynchronously
+                  params = {
+                      'inputConfiguration': {
+                          's3Uri': input_s3_uri
+                      },
+                      'outputConfiguration': {
+                          's3Uri': output_s3_uri
+                      },
+                      'dataAutomationConfiguration': {
+                          'dataAutomationProjectArn': PROJECT_ARN
+                      },
+                      'dataAutomationProfileArn': f"arn:aws:bedrock:{AWS_REGION}:{AWS_ACCOUNT_ID}:data-automation-profile/us.data-automation-v1",
+                      'notificationConfiguration': {
+                          'eventBridgeConfiguration': { 
+                              'eventBridgeEnabled': True
+                          }
+                      },
+                  }
+                  print(params)
+                  
+                  response = bedrock_client.invoke_data_automation_async(**params)
+                  
+                  print(f"Started data automation job arn: {response['invocationArn']}")
+                  print(f"Input: {input_s3_uri}")
+                  print(f"Output will go to: {output_s3_uri}")
+          
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Processing initiated for file: {key}',
+                          'invocationArn': response['invocationArn']
+                      })
+                  }
+                      
+              except Exception as e:
+                  print(f"Error processing file: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'message': f'Error processing file: {str(e)}'
+                      })
+                  }
+      Description: Lambda function that processes new forms and sends them to BDA
+      MemorySize: 128
+      Timeout: 60
+      Environment:
+        Variables:
+          OUTPUT_PREFIX: output
+          AWS_ACCOUNT_ID: !Ref AWS::AccountId
+          PROJECT_ARN: !Ref ClaimFormProcessing
+
+  PolicyFromS3ToBDAProject:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - bedrock:InvokeDataAutomationAsync
+            Resource:
+              - !Ref ClaimFormProcessing
+              - !Sub "arn:aws:bedrock:*:${AWS::AccountId}:data-automation-profile/us.data-automation-v1"
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt BDABucket.Arn
+              - !Sub ${BDABucket.Arn}/*
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:Encrypt
+              - kms:GenerateDataKey*
+              - kms:ReEncrypt*
+              - kms:DescribeKey
+            Resource: !GetAtt BDABucketKMSKey.Arn
+          - Effect: Allow
+            Action:
+              - sqs:SendMessage
+            Resource:
+              - !GetAtt LambdaDLQQueue.Arn
+
+  PolicyFromBDAProjectToS3:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt BDABucket.Arn
+              - !Sub ${BDABucket.Arn}/*
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:Encrypt
+              - kms:GenerateDataKey*
+              - kms:ReEncrypt*
+              - kms:DescribeKey
+            Resource: !GetAtt BDABucketKMSKey.Arn
+          - Effect: Allow
+            Action:
+              - sqs:SendMessage
+            Resource:
+              - !GetAtt LambdaDLQQueue.Arn
+
+  RoleLambdaNewFormToBDAProject:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref PolicyFromS3ToBDAProject
+
+  RoleLambdaFromBDAProjectToS3:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref PolicyFromBDAProjectToS3
+
+  LambdaPermissionLambdaNewFormToBDAProject:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !Ref LambdaNewFormToBDAProject
+      Action: lambda:InvokeFunction
+      SourceArn: !GetAtt BDABucket.Arn
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  ClaimFormBlueprint:
+    Type: AWS::Bedrock::Blueprint
+    Properties:
+      BlueprintName: !Sub ${AWS::StackName}-ClaimForm
+      Schema:
+        $schema: http://json-schema.org/draft-07/schema#
+        description: This is a blueprint for a Health Insurance Claim Form
+        class: Health Insurance Claim Form
+        type: object
+        definitions:
+          Services:
+            type: object
+            properties:
+              From Date:
+                type: string
+                inferenceType: inferred
+                instruction: Start date of the service provided in column A.  Format it as a date in the format YYYY-MM-DD.
+              To Date:
+                type: string
+                inferenceType: inferred
+                instruction: End date of the service provided in column A. Format it as a date in the format YYYY-MM-DD.
+              Place of Service:
+                type: string
+                inferenceType: explicit
+                instruction: Location where the service was provided from column B.
+              EMG:
+                type: string
+                inferenceType: explicit
+                instruction: Emergency indicator for the service from column C.
+              OPTHCPCS:
+                type: string
+                inferenceType: explicit
+                instruction: Healthcare Common Procedure Coding System code for the service in column D labaled OPT/HCPCS.
+              Modifier:
+                type: string
+                inferenceType: explicit
+                instruction: Modifier code for the service from column D.
+              Modifier2:
+                type: string
+                inferenceType: explicit
+                instruction: Secondary modifier code for the service from column D.
+              Modifier3:
+                type: string
+                inferenceType: explicit
+                instruction: Tertiary modifier code for the service from column D.
+              Diagnosis Pointer:
+                type: string
+                inferenceType: explicit
+                instruction: Pointer to the diagnosis code for the service from column E.
+              Charges:
+                type: number
+                inferenceType: inferred
+                instruction: Amount charged for the service from column F.  Format as currency in 0.00
+              Days or Units:
+                type: number
+                inferenceType: explicit
+                instruction: Number of days or units for the service from column G.
+              Provider ID:
+                type: string
+                inferenceType: explicit
+                instruction: ID of the provider who performed the service from column J.
+              Line Number:
+                type: number
+                inferenceType: explicit
+                instruction: The line number in the left most position.  It is either 1,2,3,4,5 or 6.
+        properties:
+          Patient Name:
+            type: string
+            inferenceType: explicit
+            instruction: Name of the patient filing the claim in box 2.
+          Federal Tax ID:
+            type: string
+            inferenceType: explicit
+            instruction: Federal tax ID number of the provider in box 25.
+          Total Charge:
+            type: number
+            inferenceType: explicit
+            instruction: Total amount charged for the services provided in box 28.
+          Patient Address:
+            type: string
+            inferenceType: explicit
+            instruction: Address of the patient filing the claim in box 5.
+          Patient City:
+            type: string
+            inferenceType: explicit
+            instruction: City of the patient's address.  Located below the Patient Name.
+          Patient State:
+            type: string
+            inferenceType: explicit
+            instruction: State of the patient's address
+          Patient Zip:
+            type: string
+            inferenceType: explicit
+            instruction: Zip code of the patient's address
+          Services:
+            type: array
+            instruction: This data is multiline below box 24
+            items:
+              $ref: '#/definitions/Services'
+      Type: DOCUMENT
+
+  ClaimFormProcessing:
+    Type: AWS::Bedrock::DataAutomationProject
+    Properties:
+      ProjectName: !Sub ${AWS::StackName}-ClaimFormProcessing
+      CustomOutputConfiguration:
+        Blueprints:
+          - BlueprintArn: !Ref ClaimFormBlueprint
+      StandardOutputConfiguration:
+        Document:
+          Extraction: 
+              BoundingBox: 
+                State: DISABLED
+              Granularity: 
+                Types:
+                  - "PAGE"
+                  - "ELEMENT"
+          GenerativeField: 
+            State: "DISABLED"
+      OverrideConfiguration:
+        Audio: 
+            ModalityProcessing: 
+              State: DISABLED
+        Document: 
+            ModalityProcessing: 
+              State: ENABLED
+        Image: 
+            ModalityProcessing: 
+              State: DISABLED
+        Video: 
+            ModalityProcessing: 
+              State: DISABLED
+
+  CustomLambdaPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: "Policy for CustomLambdaIAMRole"
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:GetBucketNotification'
+              - 's3:PutBucketNotification'
+            Resource: !Sub 'arn:aws:s3:::${BDABucket}'
+          - Effect: Allow
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource: 'arn:aws:logs:*:*:*'
+          - Effect: Allow
+            Action:
+              - sqs:SendMessage
+            Resource:
+              - !GetAtt LambdaDLQQueue.Arn
+
+  CustomLambdaIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - !Ref CustomLambdaPolicy
+  
+  CustomResourceLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "Lambda function has CloudWatch Logs permissions via CustomLambdaPolicy"
+          - id: W89
+            reason: "Lambda function does not require VPC configuration for this use case"
+    Properties:
+      ReservedConcurrentExecutions: 10
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQQueue.Arn
+      Handler: index.lambda_handler
+      Role: !GetAtt CustomLambdaIAMRole.Arn
+      Code:
+        ZipFile: |
+            from __future__ import print_function
+            import json
+            import boto3
+            import cfnresponse
+            
+            SUCCESS = "SUCCESS"
+            FAILED = "FAILED"
+            
+            print('Loading function')
+            s3 = boto3.resource('s3')
+            
+            def lambda_handler(event, context):
+                print("Received event: " + json.dumps(event, indent=2))
+                responseData={}
+                try:
+                    if event['RequestType'] == 'Delete':
+                        print("Request Type:",event['RequestType'])
+                        Bucket=event['ResourceProperties']['Bucket']
+                        delete_notification(Bucket)
+                        print("Sending response to custom resource after Delete")
+                    elif event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                        print("Request Type:",event['RequestType'])
+                        LambdaArn=event['ResourceProperties']['LambdaArn']
+                        Bucket=event['ResourceProperties']['Bucket']
+                        add_notification(LambdaArn, Bucket)
+                        responseData={'Bucket':Bucket}
+                        print("Sending response to custom resource")
+                    responseStatus = 'SUCCESS'
+                except Exception as e:
+                    print('Failed to process:', e)
+                    responseStatus = 'FAILED'
+                    responseData = {'Failure': 'Something bad happened.'}
+                cfnresponse.send(event, context, responseStatus, responseData, "CustomResourcePhysicalID")
+
+            def add_notification(LambdaArn, Bucket):
+                bucket_notification = s3.BucketNotification(Bucket)
+                response = bucket_notification.put(
+                  NotificationConfiguration={
+                    'LambdaFunctionConfigurations': [
+                      {
+                          'LambdaFunctionArn': LambdaArn,
+                          'Events': [
+                              's3:ObjectCreated:*'  
+                          ],
+                          'Filter': {
+                              'Key': {
+                                  'FilterRules': [
+                                      {
+                                          'Name': 'prefix',
+                                          'Value': 'input/'
+                                      }
+                                  ]
+                              }
+                          }
+                      }
+                    ]
+                  }
+                )
+                print("Put request completed....")
+              
+            def delete_notification(Bucket):
+                bucket_notification = s3.BucketNotification(Bucket)
+                response = bucket_notification.put(
+                    NotificationConfiguration={}
+                )
+                print("Delete request completed....")
+      MemorySize: 128
+      Runtime: python3.13
+      Timeout: 60
+
+  LambdaTrigger:
+    Type: 'Custom::LambdaTrigger'
+    DependsOn: LambdaPermissionLambdaNewFormToBDAProject
+    Properties:
+      ServiceToken: !GetAtt CustomResourceLambdaFunction.Arn
+      LambdaArn: !GetAtt LambdaNewFormToBDAProject.Arn
+      Bucket: !Ref BDABucket
+
+  LambdaFromBDAProjectToS3:
+    Type: "AWS::Lambda::Function"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "Lambda function has CloudWatch Logs permissions via AWSLambdaBasicExecutionRole"
+          - id: W89
+            reason: "Lambda function does not require VPC configuration for this use case"
+    Properties:
+      ReservedConcurrentExecutions: 10
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQQueue.Arn
+      Handler: index.lambda_handler
+      Role: !GetAtt RoleLambdaFromBDAProjectToS3.Arn
+      Runtime: python3.13
+      Code: 
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import re
+          import csv
+          from collections import defaultdict
+
+          AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
+          S3_KEYVALUES_PREFIX = os.environ.get('S3_KEYVALUES_PREFIX', 'keyvalues')
+          S3_TABLES_PREFIX = os.environ.get('S3_TABLEVALUES_PREFIX', 'tables')
+
+          s3 = boto3.client('s3', region_name=AWS_REGION)
+
+          PATIENT_KEYS = ["Patient Name","Patient Address","Patient City","Patient State","Patient Zip","Total Charge","Federal Tax ID"]
+          PATIENT_COLS = ['patientname','patientaddress','city','state','zipcode','totalcharge','federaltaxid']
+          PATIENT_NAME_KEY = "Patient Name"
+          TABLE_KEYS = ["XXXNULLXXX", "Place of Service", "To Date", "OPTHCPCS", "Diagnosis Pointer", "Provider ID", "From Date", "Modifier2", "Charges", "Modifier", "Days or Units", "EMG", "Modifier3"]
+          TABLE_COLS = ["patientname", "placeofservice", "todate", "othpcs", "diagnosispointer", "providerid", "fromdate", "modier2", "charges", "modeir", "daysor", "emg", "modier3"]
+
+          def lambda_handler(event, context):
+              
+              # Get what we need from from the event
+              output_bucket = event['detail']['output_s3_location']['s3_bucket']
+              output_name = event['detail']['output_s3_location']['name']
+              output_key = output_name + '/custom_output/0/result.json'
+
+              # Get what we need from from the bda output
+              response = s3.get_object(Bucket=output_bucket, Key=output_key)
+              content = response['Body'].read().decode('utf-8')
+              data = json.loads(content)
+              patient_data = data['inference_result']
+              services = patient_data['Services']
+
+              #Setup JSON for csv
+              row_data = {
+                  json_key: get_nested(patient_data, doc_key, default="")
+                  for doc_key, json_key in zip(PATIENT_KEYS, PATIENT_COLS)
+              }
+
+              # Get clean patient name for file name
+              patient_text = re.sub('[^a-zA-Z0-9 \n\.]', '', get_nested(patient_data, PATIENT_NAME_KEY, default=""))
+
+              # Overwrite the patient name with the clean patient name
+              row_data['patientname'] = patient_text
+              row = [row_data]
+
+              filename = patient_text + '_keyvalues.csv'
+              filepath = "/tmp/" + filename
+              s3key = S3_KEYVALUES_PREFIX + '/' + filename
+
+              # Create csv
+              with open(filepath, 'w', newline='') as csvfile:
+                  writer = csv.DictWriter(csvfile, fieldnames=PATIENT_COLS)
+                  writer.writeheader()
+                  writer.writerows(row)
+              # Upload to S3
+              s3.upload_file(filepath, output_bucket, s3key)
+
+              # Get Service Data
+              row = []
+              for service in services:
+                  #write csv
+                  row_data = {
+                      json_key: get_nested(service, doc_key, default="")
+                      for doc_key, json_key in zip(TABLE_KEYS, TABLE_COLS)
+                  }
+                  # add foriegn key
+                  row_data['patientname'] = patient_text
+                  row.append(row_data)
+
+              # Get file specifics
+              filename = patient_text + '_tablevalues.csv'
+              filepath = "/tmp/" + filename
+              s3key = S3_TABLES_PREFIX + '/' + filename
+
+              # Create csv
+              with open(filepath, 'w', newline='') as csvfile:
+                  writer = csv.DictWriter(csvfile, fieldnames=TABLE_COLS)
+                  writer.writeheader()
+                  writer.writerows(row)
+
+              # Upload to S3
+              s3.upload_file(filepath, output_bucket, s3key)
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('For data successfully processed.')
+              }
+
+          def get_nested(data, *keys, default=None):
+              for key in keys:
+                  if isinstance(data, dict):
+                      data = data.get(key, {})
+                  else:
+                      return default
+              return data or default
+              
+      Environment:
+        Variables:
+          S3_KEYVALUES_PREFIX: "forglue/keyvalues"
+          S3_TABLEVALUES_PREFIX: "forglue/tablevalues"
+
+  EventsRuleBDAClaimFormComplete:
+    Type: "AWS::Events::Rule"
+    Properties:
+      EventPattern:
+        detail-type:
+        - "Bedrock Data Automation Job Succeeded"
+        source:
+        - "aws.bedrock"
+        detail:
+          output_s3_location:
+            s3_bucket:
+            - !Ref BDABucket
+            name:
+            - prefix: "output"
+      Targets:
+      - Arn:
+          Fn::GetAtt:
+          - "LambdaFromBDAProjectToS3"
+          - "Arn"
+        RoleArn:
+          Fn::GetAtt:
+          - "RoleEventBridgeInvokeLambdaBDAProjectToS3"
+          - "Arn"
+        Id: "Target0"
+      State: "ENABLED"
+
+  ManagedPolicyEventBridgeInvokeLambdaBDAProjectToS3:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      Path: "/service-role/"
+      Description: ""
+      Groups: []
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Resource: 
+          - !GetAtt LambdaFromBDAProjectToS3.Arn
+          Action:
+          - "lambda:InvokeFunction"
+          Effect: "Allow"
+
+  RoleEventBridgeInvokeLambdaBDAProjectToS3:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Path: "/service-role/"
+      ManagedPolicyArns:
+      - !Ref ManagedPolicyEventBridgeInvokeLambdaBDAProjectToS3
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Condition:
+            StringEquals:
+              aws:SourceAccount: !Ref AWS::AccountId
+          Action: "sts:AssumeRole"
+          Effect: "Allow"
+          Principal:
+            Service: "events.amazonaws.com"
+          Sid: "TrustEventBridgeService"
+
+  ########################
+  ##### KMS KEY STUFF #####
+  ########################
+
+  BDABucketKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for encrypting S3 bucket objects
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-policy
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: Allow Bedrock Data Automation to use the key
+            Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+          - Sid: Allow Lambda to use the key
+            Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+          - Sid: Allow QuickSight to use the key
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:role/service-role/aws-quicksight-service-role-v0
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+
+  BDABucketKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${AWS::StackName}-bda-bucket-key
+      TargetKeyId: !Ref BDABucketKMSKey
+
+  Datacatalogsettings:
+    Type: 'AWS::Glue::DataCatalogEncryptionSettings'
+    Properties:
+      CatalogId: !Ref "AWS::AccountId"
+      DataCatalogEncryptionSettings:
+        ConnectionPasswordEncryption:
+          ReturnConnectionPasswordEncrypted: True
+        EncryptionAtRest:
+          CatalogEncryptionMode: DISABLED
+
+  GlueDatabase:
+    Type: "AWS::Glue::Database"
+    Properties:
+      DatabaseInput: 
+        Description: Database to hold extracted content from documents
+      CatalogId: !Ref "AWS::AccountId"
+
+  GlueClassifier:
+    Type: "AWS::Glue::Classifier"
+    Properties:
+      CsvClassifier: 
+        AllowSingleColumn: false
+        ContainsHeader: "UNKNOWN"
+        Delimiter: ","
+        DisableValueTrimming: false
+        QuoteSymbol: "\""
+
+  MyCustomWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub ${AWS::StackName}-MyCustomWorkGroup
+      Description: My WorkGroup
+      State: ENABLED
+      WorkGroupConfiguration:
+        BytesScannedCutoffPerQuery: 200000000
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: false
+        EngineVersion:
+          SelectedEngineVersion: AUTO
+        RequesterPaysEnabled: true
+        ResultConfiguration:
+          EncryptionConfiguration:
+            EncryptionOption: SSE_KMS
+            KmsKey: !GetAtt BDABucketKMSKey.Arn
+          OutputLocation: !Sub s3://${BDABucket}/athena/ 
+
+  AthenaQueryS3BucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    DependsOn: 
+      - BDABucket   
+    Properties:
+      Bucket: !Ref BDABucket
+      PolicyDocument:
+        Statement:
+          - Action:
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:List*            
+            Effect: Allow
+            Resource: 
+              - !GetAtt BDABucket.Arn
+              - !Sub ${BDABucket.Arn}/*
+            Principal: 
+                Service:
+                - athena.amazonaws.com
+            Condition:
+              Bool:
+                aws:SecureTransport: true
+  KeyGlueTable:
+    DependsOn: GlueDatabase
+    Type: "AWS::Glue::Table"
+    Properties:
+      DatabaseName: !Ref GlueDatabase
+      CatalogId: !Ref "AWS::AccountId"
+      TableInput: 
+        Owner: "owner"
+        Description: Hold metadata related to key values
+        TableType: "EXTERNAL_TABLE"
+        Parameters: 
+          CrawlerSchemaDeserializerVersion: "1.0"
+          CrawlerSchemaSerializerVersion: "1.0"
+          areColumnsQuoted: "false"
+          averageRecordSize: "239"
+          classification: "csv"
+          columnsOrdered: "true"
+          compressionType: "bzip2"
+          delimiter: ","
+          objectCount: "20"
+          recordCount: "165954"
+          sizeKey: "40341559"
+          "skip.header.line.count": "1"
+          typeOfData: "file"
+        StorageDescriptor: 
+          Columns: 
+            - Name: "patientname"
+              Type: "string"
+            - Name: "federaltaxid"
+              Type: "string"
+            - Name: "totalcharge"
+              Type: "bigint"
+            - Name: "patientaddress"
+              Type: "string"
+            - Name: "city"
+              Type: "string"
+            - Name: "state"
+              Type: "string"
+            - Name: "zipcode"
+              Type: "string"
+          Location: !Sub s3://${BDABucket}/forglue/keyvalues/
+          InputFormat: "org.apache.hadoop.mapred.TextInputFormat"
+          OutputFormat: "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"
+          Compressed: true
+          NumberOfBuckets: -1
+          SerdeInfo: 
+            SerializationLibrary: "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe"
+            Parameters: 
+              "field.delim": ","
+          Parameters: 
+            CrawlerSchemaDeserializerVersion: "1.0"
+            CrawlerSchemaSerializerVersion: "1.0"
+            areColumnsQuoted: "false"
+            averageRecordSize: "239"
+            classification: "csv"
+            columnsOrdered: "true"
+            compressionType: "bzip2"
+            delimiter: ","
+            objectCount: "20"
+            recordCount: "1"
+            sizeKey: "40341559"
+            "skip.header.line.count": "1"
+            typeOfData: "file"
+          StoredAsSubDirectories: false
+        Retention: 0
+
+  TableGlueTable:
+    DependsOn: GlueDatabase
+    Type: "AWS::Glue::Table"
+    Properties:
+      DatabaseName: !Ref GlueDatabase
+      CatalogId: !Ref "AWS::AccountId"
+      TableInput: 
+        Owner: "owner"
+        Description: Hold metadata related to table values
+        TableType: "EXTERNAL_TABLE"
+        Parameters: 
+          CrawlerSchemaDeserializerVersion: "1.0"
+          CrawlerSchemaSerializerVersion: "1.0"
+          areColumnsQuoted: "false"
+          averageRecordSize: "1343"
+          classification: "csv"
+          columnsOrdered: "true"
+          compressionType: "bzip2"
+          delimiter: ","
+          objectCount: "40"
+          recordCount: "2905874"
+          sizeKey: "3930505238"
+          "skip.header.line.count": "1"
+          typeOfData: "file"
+        StorageDescriptor: 
+          Columns: 
+            - Name: "patientname"
+              Type: "string"    
+            - Name: "placeofservice"
+              Type: "string"
+            - Name: "todate"
+              Type: "date"
+            - Name: "othpcs"
+              Type: "string"
+            - Name: "diagnosispointer"
+              Type: "string"
+            - Name: "providerid"
+              Type: "string"
+            - Name: "fromdate"
+              Type: "date"
+            - Name: "modier2"
+              Type: "string"
+            - Name: "charges"
+              Type: "bigint"
+            - Name: "modier"
+              Type: "string"
+            - Name: "daysor"
+              Type: "string"
+            - Name: "emg"
+              Type: "string"
+            - Name: "modier3"
+              Type: "string"
+          Location: !Sub s3://${BDABucket}/forglue/tablevalues/                    
+          InputFormat: "org.apache.hadoop.mapred.TextInputFormat"
+          OutputFormat: "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"
+          Compressed: true
+          NumberOfBuckets: -1
+          SerdeInfo: 
+            SerializationLibrary: "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe"
+            Parameters: 
+              "field.delim": ","
+          Parameters: 
+            CrawlerSchemaDeserializerVersion: "1.0"
+            CrawlerSchemaSerializerVersion: "1.0"
+            areColumnsQuoted: "false"
+            averageRecordSize: "1343"
+            classification: "csv"
+            columnsOrdered: "true"
+            compressionType: "bzip2"
+            delimiter: ","
+            objectCount: "40"
+            recordCount: "1"
+            sizeKey: "3930505238"
+            "skip.header.line.count": "1"
+            typeOfData: "file"
+          StoredAsSubDirectories: false
+        Retention: 0
+
+  AthenaNamedQuery1:
+      Type: "AWS::Athena::NamedQuery"
+      DependsOn: [MyCustomWorkGroup, KeyGlueTable, TableGlueTable]
+      Properties:
+          Description: "document_extract_view"
+          Database: !Ref GlueDatabase
+          WorkGroup: !Ref MyCustomWorkGroup
+          QueryString: !Sub |
+                  CREATE OR REPLACE VIEW "document_view" AS 
+                  SELECT
+                    a.*
+                  , b.*
+                  FROM
+                    ((
+                      SELECT
+                        patientname
+                      , patientaddress
+                      , city
+                      , state
+                      , zipcode
+                      , totalcharge
+                      , federaltaxid
+                      FROM
+                        "${GlueDatabase}"."${KeyGlueTable}"
+                  )  a
+                  INNER JOIN (
+                      SELECT
+                        fromdate dateofservice
+                      , othpcs Procedure
+                      , charges
+                      , providerid
+                      , patientname tablevaluepatientname
+                      FROM
+                        "${GlueDatabase}"."${TableGlueTable}"
+                  )  b ON (a.patientname = b.tablevaluepatientname))       
