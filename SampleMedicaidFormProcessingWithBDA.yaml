@@ -1,6 +1,8 @@
 Resources:
-  S3TLSPolicy:
+  S3BucketPolicy:
     Type: AWS::S3::BucketPolicy
+    DependsOn: 
+      - BDABucket   
     Properties:
       Bucket: !Ref BDABucket
       PolicyDocument:
@@ -16,6 +18,21 @@ Resources:
             Condition:
               Bool:
                 aws:SecureTransport: false
+          - Sid: AllowAthenaSecureAccess
+            Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:List*
+            Resource: 
+              - !GetAtt BDABucket.Arn
+              - !Sub ${BDABucket.Arn}/*
+            Principal: 
+              Service:
+                - athena.amazonaws.com
+            Condition:
+              Bool:
+                aws:SecureTransport: true
 
   BDABucket:
     Type: AWS::S3::Bucket
@@ -800,28 +817,6 @@ Resources:
             KmsKey: !GetAtt BDABucketKMSKey.Arn
           OutputLocation: !Sub s3://${BDABucket}/athena/ 
 
-  AthenaQueryS3BucketPolicy:
-    Type: 'AWS::S3::BucketPolicy'
-    DependsOn: 
-      - BDABucket   
-    Properties:
-      Bucket: !Ref BDABucket
-      PolicyDocument:
-        Statement:
-          - Action:
-              - s3:PutObject
-              - s3:DeleteObject
-              - s3:List*            
-            Effect: Allow
-            Resource: 
-              - !GetAtt BDABucket.Arn
-              - !Sub ${BDABucket.Arn}/*
-            Principal: 
-                Service:
-                - athena.amazonaws.com
-            Condition:
-              Bool:
-                aws:SecureTransport: true
   KeyGlueTable:
     DependsOn: GlueDatabase
     Type: "AWS::Glue::Table"
